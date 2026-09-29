@@ -1,0 +1,24 @@
+#!/system/bin/sh
+# The emulated panel has a fixed affine transform backed by factory EEPROM.
+# Regenerate pointercal on every boot so persistent disks cannot retain bytes
+# created by the old DDC-at-0x50 model.
+rm -f /data/misc/touchscreen/pointercal
+
+# Emulator-only state: there is no CAN bus to wake the head unit display.
+state_dir=/data/data/com.tomtom.vehiclestate.service
+mkdir -p "$state_dir"
+chown 10020.10020 "$state_dir"
+chmod 0771 "$state_dir"
+
+for marker in nocan displayon; do
+    : >"$state_dir/$marker"
+    chown 10020.10020 "$state_dir/$marker"
+    chmod 0600 "$state_dir/$marker"
+done
+
+# The real ADC is absent; its error value is interpreted as 110 C and forces
+# the temperature-protection (display-off) state. Use the firmware's file-based
+# test source at a safe nominal temperature.
+echo 25 >"$state_dir/temperature"
+chown 10020.10020 "$state_dir/temperature"
+chmod 0600 "$state_dir/temperature"

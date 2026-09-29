@@ -1,0 +1,3 @@
+#!/system/bin/sh
+# QEMU stub: report EOL settings as CONFIGURED (exit 1) so the initramfs does not wait for vehicledaemon.
+exit 1

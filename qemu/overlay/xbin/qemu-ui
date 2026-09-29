@@ -1,0 +1,30 @@
+#!/system/bin/sh
+# The production state manager has no CAN event that can transition it out of
+# UserPerceivedOff. Wait for the service-heavy Froyo startup to quiesce, then
+# open the normal TomTom home activity without faking system-wide broadcasts.
+sleep 60
+
+attempt=0
+while [ "$attempt" -lt 6 ]; do
+    /system/bin/am start -a com.tomtom.home.HomeActivity >/dev/null 2>&1
+    sleep 15
+    resumed="$(dumpsys activity activities | grep mResumedActivity)"
+    case "$resumed" in
+        *com.tomtom.focus.client/com.tomtom.home.HomeActivity*)
+            # Make sure a delayed state-service restart does not immediately put
+            # the user-off activity back in front.
+            sleep 10
+            resumed="$(dumpsys activity activities | grep mResumedActivity)"
+            case "$resumed" in
+                *com.tomtom.focus.client/com.tomtom.home.HomeActivity*)
+                    setprop qemu.ui.ready 1
+                    exit 0
+                    ;;
+            esac
+            ;;
+    esac
+    attempt=$((attempt + 1))
+done
+
+setprop qemu.ui.failed 1
+exit 1

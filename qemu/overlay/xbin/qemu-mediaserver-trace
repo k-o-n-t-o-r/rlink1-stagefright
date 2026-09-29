@@ -1,0 +1,3 @@
+#!/system/bin/sh
+# Optional mediaserver launcher used only by `rlink-qemu heap-trace-start`.
+exec /system/bin/mediaserver-trace

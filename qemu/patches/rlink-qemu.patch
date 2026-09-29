@@ -1,0 +1,1084 @@
+diff --git a/hw/arm/beagle.c b/hw/arm/beagle.c
+index 02866eed9..8a941ed24 100644
+--- a/hw/arm/beagle.c
++++ b/hw/arm/beagle.c
+@@ -30,6 +30,7 @@
+ #include "hw/sysbus.h"
+ #include "sysemu/blockdev.h"
+ #include "exec/address-spaces.h"
++#include "hw/loader.h"
+ 
+ #define BEAGLE_NAND_CS       0
+ #define BEAGLE_SMC_CS        1
+@@ -49,8 +50,79 @@ struct beagle_s {
+     void *twl4030;
+     DeviceState *smc;
+     DeviceState *ddc;
++    DeviceState *touchscreen;
+ };
+ 
++static struct arm_boot_info beagle_binfo;
++
++#define OMAP3_CM_BASE 0x48004000
++
++/* OMAP EHCI INSNREG00..05 (0x90..0xa4): the ULPI viewport in INSNREG05 must
++ * read back with the control bit clear or the kernel BUG()s; report every
++ * access as completed with data 0. */
++static uint64_t omap_ehci_insnreg_read(void *opaque, hwaddr addr, unsigned size)
++{
++    return 0;
++}
++
++static void omap_ehci_insnreg_write(void *opaque, hwaddr addr, uint64_t val,
++                                    unsigned size)
++{
++}
++
++static const MemoryRegionOps omap_ehci_insnreg_ops = {
++    .read = omap_ehci_insnreg_read,
++    .write = omap_ehci_insnreg_write,
++    .endianness = DEVICE_NATIVE_ENDIAN,
++};
++
++static void cm_rmw(uint32_t off, uint32_t mask, uint32_t val)
++{
++    hwaddr a = OMAP3_CM_BASE + off;
++    uint32_t v = ldl_le_phys(&address_space_memory, a);
++    stl_le_phys(&address_space_memory, a, (v & ~mask) | val);
++}
++
++/* Runs after the SoC reset: emulate what x-loader/u-boot leave behind when
++ * we jump straight into the kernel.
++ *  - GPMC CS0 comes out of reset as CSVALID at base 0/16MB, which
++ *    gpmc_mem_init() cannot reserve (BUG()).
++ *  - The DPLLs come out of reset in bypass/stop; the kernel expects them
++ *    programmed and locked (u-boot prcm_init() for OMAP36xx, 26 MHz sys_clk),
++ *    otherwise every dpll4 enable spins 1M x udelay(1) and fails. */
++static void beagle_kernel_reset(void *opaque)
++{
++    stl_le_phys(&address_space_memory, 0x6e000078, 0xf00); /* GPMC_CONFIG7_0 */
++
++    /* DPLL3 core 400 MHz: M=200 N=12 M2=1, L3=/2 L4=/2 */
++    cm_rmw(0x1140, 0x001f0000, 2 << 16);                  /* CLKSEL1_EMU M3X2 */
++    cm_rmw(0x0d40, 0xffff7f40, (1 << 27) | (200 << 16) | (12 << 8));
++    cm_rmw(0x0a40, 0x00000f3f, (3 << 8) | (2 << 4) | (2 << 2) | 2);
++    cm_rmw(0x0b40, 0x7, 5);                               /* CLKSEL_SGX */
++    cm_rmw(0x0c40, 0x6, 2 << 1);                          /* CLKSEL_WKUP */
++    cm_rmw(0x0d00, 0xf7, 0x7);                            /* lock core */
++    /* DPLL4 per 864 MHz: M=432 N=12, M2=9 M3=16 M4=9 M5=4 M6=3 */
++    cm_rmw(0x1140, 0x3f000000, 3 << 24);
++    cm_rmw(0x0f40, 0x3f, 4);
++    cm_rmw(0x0e40, 0x3f3f, (16 << 8) | 9);
++    cm_rmw(0x0d48, 0x1f, 9);
++    cm_rmw(0x0d44, 0x000fff7f, (432 << 8) | 12);
++    cm_rmw(0x0a40, 0x3000, 1 << 12);
++    cm_rmw(0x0d00, 0x70000, 7 << 16);                     /* lock per */
++    /* DPLL5 per2 120 MHz: M=443 N=11 M2=8 */
++    cm_rmw(0x0d50, 0x1f, 8);
++    cm_rmw(0x0d4c, 0x7ff7f, (443 << 8) | 11);
++    cm_rmw(0x0d04, 0x7, 7);
++    /* DPLL2 iva2 260 MHz: M=10 N=0 M2=1 */
++    cm_rmw(0x0044, 0x1f, 1);
++    cm_rmw(0x0040, 0x7ff7f, 10 << 8);
++    cm_rmw(0x0004, 0x7, 7);
++    /* DPLL1 mpu 600 MHz: M=300 N=12 M2=1 */
++    cm_rmw(0x0944, 0x1f, 1);
++    cm_rmw(0x0940, 0x7ff7f, (300 << 8) | 12);
++    cm_rmw(0x0904, 0x7, 7);
++}
++
+ static void beagle_common_init(MachineState *machine,
+                                ram_addr_t ram_size, int cpu_model)
+ {
+@@ -66,12 +138,18 @@ static void beagle_common_init(MachineState *machine,
+ #error MAX_SERIAL_PORTS must be at least 1!
+ #endif
+     s->cpu = omap3_mpu_init(sysmem, cpu_model, ram_size,
+-                            NULL, NULL, serial_hds[0], NULL);
++                            serial_hds[1], serial_hds[2],
++                            serial_hds[0], serial_hds[3]);
+ 
+-    s->nand = nand_init(dmtd ? blk_by_legacy_dinfo(dmtd) : NULL,
+-                        NAND_MFR_MICRON, 0xba);
+-    nand_setpins(s->nand, 0, 0, 0, 1, 0); /* no write-protect */
+-    omap_gpmc_attach_nand(s->cpu->gpmc, BEAGLE_NAND_CS, s->nand);
++    /* With -kernel and no NAND image, leave GPMC CS0 unconfigured: a
++     * CSVALID chip select at base 0 makes gpmc_mem_init() BUG() on
++     * kernels that reserve bootloader-configured GPMC regions. */
++    if (dmtd || !machine->kernel_filename) {
++        s->nand = nand_init(dmtd ? blk_by_legacy_dinfo(dmtd) : NULL,
++                            NAND_MFR_MICRON, 0xba);
++        nand_setpins(s->nand, 0, 0, 0, 1, 0); /* no write-protect */
++        omap_gpmc_attach_nand(s->cpu->gpmc, BEAGLE_NAND_CS, s->nand);
++    }
+ 
+     if (dsd) {
+         omap3_mmc_attach(s->cpu->omap3_mmc[0], blk_by_legacy_dinfo(dsd),
+@@ -93,7 +171,63 @@ static void beagle_common_init(MachineState *machine,
+      */
+     s->ddc = i2c_create_slave(omap_i2c_bus(s->cpu->i2c[2]), "i2c-ddc", 0x50);
+ 
++    /* Strasbourg uses a TSC2007 on I2C2 with active-low PENIRQ on GPIO54.
++     * Its absolute QEMU input handler lets VNC pointer events become native
++     * Linux/Android touchscreen events.  Keep it opt-in for generic Beagle. */
++    if (getenv("RLINK_TOUCHSCREEN")) {
++        s->touchscreen = i2c_create_slave(omap_i2c_bus(s->cpu->i2c[1]),
++                                          "tsc2007", 0x48);
++        qdev_connect_gpio_out(s->touchscreen, 0,
++                              qdev_get_gpio_in(s->cpu->gpio, 54));
++    }
++
+     omap_lcd_panel_attach(s->cpu->dss);
++
++    /* OMAP3 EHCI host controller is not modelled by qemu-linaro; the R-Link
++     * kernel BUG()s when the ULPI viewport never completes. A generic sysbus
++     * EHCI (caps at 0x0, opregs at 0x10, like OMAP) reads 0 for INSNREG05. */
++    {
++        DeviceState *ehci = qdev_create(NULL, "exynos4210-ehci-usb");
++        qdev_init_nofail(ehci);
++        memory_region_add_subregion_overlap(sysmem, 0x48064800,
++            sysbus_mmio_get_region(SYS_BUS_DEVICE(ehci), 0), 1);
++        sysbus_connect_irq(SYS_BUS_DEVICE(ehci), 0,
++            qdev_get_gpio_in(s->cpu->ih[0], OMAP_INT_3XXX_EHCI_IRQ));
++        MemoryRegion *insn = g_new(MemoryRegion, 1);
++        memory_region_init_io(insn, NULL, &omap_ehci_insnreg_ops, NULL,
++                              "omap-ehci-insnreg", 0x20);
++        memory_region_add_subregion_overlap(sysmem, 0x48064800 + 0x90, insn, 2);
++    }
++
++    /* -kernel: boot a Linux kernel directly instead of the OMAP3 boot ROM.
++     * RLINK_MACHID, RLINK_SYSREV, RLINK_FDT[_ADDR] env vars feed the
++     * TomTom-specific ATAGs (see hw/arm/boot.c). */
++    if (machine->kernel_filename) {
++        const char *fdt = getenv("RLINK_FDT");
++        beagle_binfo.ram_size = ram_size;
++        beagle_binfo.kernel_filename = machine->kernel_filename;
++        beagle_binfo.kernel_cmdline = machine->kernel_cmdline;
++        beagle_binfo.initrd_filename = machine->initrd_filename;
++        beagle_binfo.loader_start = OMAP3_Q2_BASE;
++        beagle_binfo.board_id = getenv("RLINK_MACHID") ?
++            strtoul(getenv("RLINK_MACHID"), NULL, 0) : 0x60a;
++        beagle_binfo.rlink_sysrev = getenv("RLINK_SYSREV") ?
++            strtoul(getenv("RLINK_SYSREV"), NULL, 0) : 0;
++        if (fdt) {
++            int n;
++            beagle_binfo.rlink_fdt_addr = getenv("RLINK_FDT_ADDR") ?
++                strtoul(getenv("RLINK_FDT_ADDR"), NULL, 0) :
++                OMAP3_Q2_BASE + ram_size - 0x1000000;
++            n = load_image_targphys(fdt, beagle_binfo.rlink_fdt_addr, 1 << 20);
++            if (n < 0) {
++                hw_error("could not load RLINK_FDT %s", fdt);
++            }
++            beagle_binfo.rlink_fdt_size = n;
++        }
++        arm_load_kernel(s->cpu->cpu, &beagle_binfo);
++        s->cpu->bootrom_initialized = 0;
++        qemu_register_reset(beagle_kernel_reset, s);
++    }
+ }
+ 
+ static void beagle_xm_init(MachineState *machine)
+diff --git a/hw/arm/boot.c b/hw/arm/boot.c
+index fa6950352..6afd84327 100644
+--- a/hw/arm/boot.c
++++ b/hw/arm/boot.c
+@@ -224,6 +224,19 @@ static void set_kernel_args(const struct arm_boot_info *info)
+         WRITE_WORD(p, 0x54410009);
+         p += cmdline_size * 4;
+     }
++    if (info->rlink_fdt_size) {
++        /* ATAG_FACTORYDATA (TomTom): address + size of the FDT blob */
++        WRITE_WORD(p, 4);
++        WRITE_WORD(p, 0x5441000A);
++        WRITE_WORD(p, info->rlink_fdt_addr);
++        WRITE_WORD(p, info->rlink_fdt_size);
++    }
++    if (info->rlink_sysrev) {
++        /* ATAG_REVISION */
++        WRITE_WORD(p, 3);
++        WRITE_WORD(p, 0x54410007);
++        WRITE_WORD(p, info->rlink_sysrev);
++    }
+     if (info->atag_board) {
+         /* ATAG_BOARD */
+         int atag_board_len;
+@@ -632,6 +645,11 @@ void arm_load_kernel(ARMCPU *cpu, struct arm_boot_info *info)
+     } else {
+         primary_loader = bootloader;
+         kernel_load_offset = KERNEL_LOAD_ADDR;
++        /* raw (uncompressed) ARM Image files must be loaded at PHYS_OFFSET +
++         * TEXT_OFFSET (0x8000); zImages relocate themselves from 0x10000. */
++        if (getenv("RLINK_KERNEL_OFFSET")) {
++            kernel_load_offset = strtoul(getenv("RLINK_KERNEL_OFFSET"), NULL, 0);
++        }
+         elf_machine = EM_ARM;
+     }
+ 
+diff --git a/hw/i2c/ddc.c b/hw/i2c/ddc.c
+index cb516bfd8..480857e77 100644
+--- a/hw/i2c/ddc.c
++++ b/hw/i2c/ddc.c
+@@ -215,30 +215,100 @@ static void build_edid_blob(const edid_data *edid, uint8_t *blob)
+ 
+ 
+ 
+-/* A simple I2C slave which just returns the contents of its EDID blob. */
++/* A simple I2C slave which normally returns monitor EDID data.  The R-LINK
++ * kernel describes the device at this address as an 8 KiB 24C64 EEPROM and
++ * its EOL library reads the factory MMI language from byte 0x103.  When
++ * RLINK_EEPROM_MMI_LANGUAGE is present, provide the two-byte-addressed,
++ * writable EEPROM expected by that firmware instead of the one-byte DDC
++ * device.  Keeping both behaviours lets the generic Beagle machine retain
++ * its historical monitor model when it is not used for R-LINK. */
+ 
+ #define TYPE_I2CDDC "i2c-ddc"
+ #define I2CDDC(obj) OBJECT_CHECK(I2CDDCState, (obj), TYPE_I2CDDC)
++#define RLINK_EEPROM_SIZE 8192
++#define RLINK_EEPROM_MMI_LANGUAGE_OFFSET 0x103
++#define RLINK_EEPROM_ECU_OFFSET 0x112
++#define RLINK_EEPROM_ECU_ANDROID_AUTO 0x40
++#define RLINK_EEPROM_TOUCH_CAL_OFFSET 0x1250
+ 
+ typedef struct I2CDDCState {
+     I2CSlave parent_obj;
+     int firstbyte;
+-    uint8_t reg;
++    uint16_t reg;
+     uint8_t edid_blob[128];
++    int rlink_eeprom;
++    int address_bytes;
++    int ddc_read;
++    uint8_t address[2];
++    uint8_t eeprom_blob[RLINK_EEPROM_SIZE];
+ } I2CDDCState;
+ 
++static void build_rlink_eeprom(I2CDDCState *s, uint8_t language,
++                               bool android_auto)
++{
++    static const int32_t touch_calibration[7] = {
++        -13517, 26, 53414312, 44, -8383, 32074952, 65536
++    };
++    unsigned int page, half, i, edid_offset;
++
++    /* Preserve the bytes that the old one-byte DDC model exposed through
++     * Linux's 24C64 driver, then replace the factory settings that QEMU
++     * deliberately models. */
++    for (page = 0; page < RLINK_EEPROM_SIZE / 256; page++) {
++        for (half = 0; half < 2; half++) {
++            for (i = 0; i < 128; i++) {
++                edid_offset = page + 1 + i;
++                s->eeprom_blob[page * 256 + half * 128 + i] =
++                    edid_offset < sizeof(s->edid_blob) ?
++                    s->edid_blob[edid_offset] : 0;
++            }
++        }
++    }
++    s->eeprom_blob[RLINK_EEPROM_MMI_LANGUAGE_OFFSET] = language;
++    if (android_auto) {
++        s->eeprom_blob[RLINK_EEPROM_ECU_OFFSET] |=
++            RLINK_EEPROM_ECU_ANDROID_AUTO;
++    }
++    for (i = 0; i < ARRAY_SIZE(touch_calibration); i++) {
++        uint32_t value = touch_calibration[i];
++        unsigned int offset = RLINK_EEPROM_TOUCH_CAL_OFFSET + i * 4;
++
++        s->eeprom_blob[offset] = value;
++        s->eeprom_blob[offset + 1] = value >> 8;
++        s->eeprom_blob[offset + 2] = value >> 16;
++        s->eeprom_blob[offset + 3] = value >> 24;
++    }
++}
++
+ static void i2c_ddc_reset(DeviceState *ds)
+ {
+     I2CDDCState *s = I2CDDC(ds);
+     s->firstbyte = 0;
++    s->address_bytes = 0;
++    s->ddc_read = 0;
+     s->reg = 0;
+ }
+ 
+ static void i2c_ddc_event(I2CSlave *i2c, enum i2c_event event)
+ {
+     I2CDDCState *s = I2CDDC(i2c);
++
++    if (!s->rlink_eeprom) {
++        if (event == I2C_START_SEND) {
++            s->firstbyte = 1;
++        }
++        return;
++    }
++
+     if (event == I2C_START_SEND) {
+-        s->firstbyte = 1;
++        s->address_bytes = 0;
++        s->ddc_read = 0;
++    } else if (event == I2C_START_RECV) {
++        s->ddc_read = s->address_bytes == 1;
++        if (s->ddc_read) {
++            /* Also provide valid EDID for a one-byte-addressed DDC reader. */
++            s->reg = s->address[0];
++        }
+     }
+ }
+ 
+@@ -246,6 +316,19 @@ static int i2c_ddc_rx(I2CSlave *i2c)
+ {
+     I2CDDCState *s = I2CDDC(i2c);
+     int value;
++
++    if (s->rlink_eeprom) {
++        if (s->ddc_read) {
++            value = s->reg < sizeof(s->edid_blob) ?
++                s->edid_blob[s->reg] : 0;
++            s->reg++;
++        } else {
++            value = s->eeprom_blob[s->reg % RLINK_EEPROM_SIZE];
++            s->reg = (s->reg + 1) % RLINK_EEPROM_SIZE;
++        }
++        return value;
++    }
++
+     if (s->reg < sizeof(s->edid_blob)) {
+         value = s->edid_blob[s->reg];
+     } else {
+@@ -258,6 +341,21 @@ static int i2c_ddc_rx(I2CSlave *i2c)
+ static int i2c_ddc_tx(I2CSlave *i2c, uint8_t data)
+ {
+     I2CDDCState *s = I2CDDC(i2c);
++
++    if (s->rlink_eeprom) {
++        if (s->address_bytes < 2) {
++            s->address[s->address_bytes++] = data;
++            if (s->address_bytes == 2) {
++                s->reg = ((uint16_t)s->address[0] << 8) | s->address[1];
++                s->reg %= RLINK_EEPROM_SIZE;
++            }
++        } else {
++            s->eeprom_blob[s->reg] = data;
++            s->reg = (s->reg + 1) % RLINK_EEPROM_SIZE;
++        }
++        return 1;
++    }
++
+     if (s->firstbyte) {
+         s->reg = data;
+         s->firstbyte = 0;
+@@ -272,7 +370,38 @@ static int i2c_ddc_tx(I2CSlave *i2c, uint8_t data)
+ static int i2c_ddc_init(I2CSlave *i2c)
+ {
+     I2CDDCState *s = I2CDDC(i2c);
++    const char *language_string = getenv("RLINK_EEPROM_MMI_LANGUAGE");
++    const char *android_auto_string = getenv("RLINK_EEPROM_ANDROID_AUTO");
++    char *end = NULL;
++    unsigned long language;
++    bool android_auto = false;
++
+     build_edid_blob(&lcd_edid, s->edid_blob);
++    if (!language_string || !*language_string) {
++        return 0;
++    }
++
++    language = strtoul(language_string, &end, 0);
++    if (!end || *end || language > 0xff) {
++        fprintf(stderr, "invalid RLINK_EEPROM_MMI_LANGUAGE: %s\n",
++                language_string);
++        return -1;
++    }
++
++    if (android_auto_string && *android_auto_string) {
++        if (!strcmp(android_auto_string, "0")) {
++            android_auto = false;
++        } else if (!strcmp(android_auto_string, "1")) {
++            android_auto = true;
++        } else {
++            fprintf(stderr, "invalid RLINK_EEPROM_ANDROID_AUTO: %s\n",
++                    android_auto_string);
++            return -1;
++        }
++    }
++
++    s->rlink_eeprom = 1;
++    build_rlink_eeprom(s, language, android_auto);
+     return 0;
+ }
+ 
+diff --git a/hw/input/Makefile.objs b/hw/input/Makefile.objs
+index e8c80b9de..cb517c17c 100644
+--- a/hw/input/Makefile.objs
++++ b/hw/input/Makefile.objs
+@@ -6,6 +6,7 @@ common-obj-$(CONFIG_PL050) += pl050.o
+ common-obj-y += ps2.o
+ common-obj-$(CONFIG_STELLARIS_INPUT) += stellaris_input.o
+ common-obj-$(CONFIG_TSC2005) += tsc2005.o
++common-obj-y += tsc2007.o
+ common-obj-$(CONFIG_VMMOUSE) += vmmouse.o
+ 
+ obj-$(CONFIG_MILKYMIST) += milkymist-softusb.o
+diff --git a/hw/input/tsc2007.c b/hw/input/tsc2007.c
+new file mode 100644
+index 000000000..afa677295
+--- /dev/null
++++ b/hw/input/tsc2007.c
+@@ -0,0 +1,251 @@
++/*
++ * TI TSC2007 touchscreen controller emulation for TomTom R-LINK.
++ *
++ * Copyright (c) 2026
++ *
++ * This file is licensed under the GNU GPL, version 2 or later.
++ */
++
++#include "hw/i2c/i2c.h"
++#include "ui/console.h"
++#include "ui/input.h"
++
++#define TYPE_TSC2007 "tsc2007"
++#define TSC2007(obj) OBJECT_CHECK(TSC2007State, (obj), TYPE_TSC2007)
++
++#define TSC2007_MEASURE_TEMP0    0x00
++#define TSC2007_MEASURE_AUX      0x20
++#define TSC2007_MEASURE_TEMP1    0x40
++#define TSC2007_MEASURE_X        0xc0
++#define TSC2007_MEASURE_Y        0xd0
++#define TSC2007_MEASURE_Z1       0xe0
++#define TSC2007_MEASURE_Z2       0xf0
++
++#define TSC2007_MAX_12BIT        4095
++#define RLINK_LCD_WIDTH          800
++#define RLINK_LCD_HEIGHT         480
++
++/* Factory calibration consumed by /system/bin/readcal. */
++#define CAL_A                    (-13517)
++#define CAL_B                    26
++#define CAL_C                    53414312
++#define CAL_D                    44
++#define CAL_E                    (-8383)
++#define CAL_F                    32074952
++#define CAL_SCALE                65536
++
++typedef struct TSC2007State {
++    I2CSlave parent_obj;
++    qemu_irq penirq;
++
++    uint8_t command;
++    int rx_byte;
++    int x;
++    int y;
++    int pressed;
++} TSC2007State;
++
++static int tsc2007_clamp_12bit(int value)
++{
++    if (value < 1) {
++        return 1;
++    }
++    if (value >= TSC2007_MAX_12BIT) {
++        return TSC2007_MAX_12BIT - 1;
++    }
++    return value;
++}
++
++static void tsc2007_set_position(TSC2007State *s, int x, int y)
++{
++    int screen_x, screen_y;
++    int64_t rhs_x, rhs_y, determinant;
++    int64_t raw_x, raw_y;
++
++    x = MAX(0, MIN(x, INPUT_EVENT_ABS_SIZE - 1));
++    y = MAX(0, MIN(y, INPUT_EVENT_ABS_SIZE - 1));
++    screen_x = (int64_t)x * (RLINK_LCD_WIDTH - 1) /
++               (INPUT_EVENT_ABS_SIZE - 1);
++    screen_y = (int64_t)y * (RLINK_LCD_HEIGHT - 1) /
++               (INPUT_EVENT_ABS_SIZE - 1);
++
++    /* Invert tslib's affine transform so a VNC pixel maps back to the raw
++     * 12-bit sample expected by the production calibration. */
++    rhs_x = (int64_t)screen_x * CAL_SCALE - CAL_C;
++    rhs_y = (int64_t)screen_y * CAL_SCALE - CAL_F;
++    determinant = (int64_t)CAL_A * CAL_E - (int64_t)CAL_B * CAL_D;
++    raw_x = (rhs_x * CAL_E - (int64_t)CAL_B * rhs_y) / determinant;
++    raw_y = ((int64_t)CAL_A * rhs_y - (int64_t)CAL_D * rhs_x) /
++            determinant;
++
++    s->x = tsc2007_clamp_12bit(raw_x);
++    s->y = tsc2007_clamp_12bit(raw_y);
++}
++
++static void tsc2007_update_penirq(TSC2007State *s)
++{
++    /* TSC2007 PENIRQ and Strasbourg GPIO54 are active low. */
++    qemu_set_irq(s->penirq, !s->pressed);
++}
++
++static void tsc2007_touch_event(void *opaque, int x, int y, int dz,
++                                int buttons_state)
++{
++    TSC2007State *s = opaque;
++    int pressed = !!(buttons_state & MOUSE_EVENT_LBUTTON);
++
++    if (pressed) {
++        tsc2007_set_position(s, x, y);
++    }
++    if (pressed != s->pressed) {
++        s->pressed = pressed;
++        tsc2007_update_penirq(s);
++    }
++}
++
++static uint16_t tsc2007_pressure_z1(TSC2007State *s)
++{
++    int64_t x_resistance, y_resistance, denominator;
++    int z1;
++
++    if (!s->pressed) {
++        return 0;
++    }
++
++    /* Select Z1 so the firmware's resistance formula yields approximately
++     * 1000 ohms throughout the panel, safely below its max_rt of 3500. */
++    x_resistance = ((int64_t)1250 * s->x + 2047) >> 12;
++    y_resistance = ((int64_t)350 * (4096 - s->y) + 2047) >> 12;
++    denominator = 1000 + y_resistance + x_resistance;
++    z1 = denominator ? (4096 * x_resistance) / denominator : 1;
++    return tsc2007_clamp_12bit(z1);
++}
++
++static uint16_t tsc2007_sample(TSC2007State *s)
++{
++    if (!s->pressed && (s->command & 0xf0) >= TSC2007_MEASURE_X) {
++        return 0;
++    }
++
++    switch (s->command & 0xf0) {
++    case TSC2007_MEASURE_X:
++        return s->x;
++    case TSC2007_MEASURE_Y:
++        return s->y;
++    case TSC2007_MEASURE_Z1:
++        return tsc2007_pressure_z1(s);
++    case TSC2007_MEASURE_Z2:
++        return s->pressed ? TSC2007_MAX_12BIT : 0;
++    case TSC2007_MEASURE_TEMP0:
++        /* Command 0 is power-down; READ_TEMP0 has ADC power bits set. */
++        return s->command ? 1000 : 0;
++    case TSC2007_MEASURE_TEMP1:
++        return 1264;
++    case TSC2007_MEASURE_AUX:
++        return 2048;
++    default:
++        return 0;
++    }
++}
++
++static int tsc2007_rx(I2CSlave *i2c)
++{
++    TSC2007State *s = TSC2007(i2c);
++    uint16_t sample = tsc2007_sample(s);
++
++    /* Wire format is D11..D4 followed by D3..D0 in the high nibble. */
++    if (s->rx_byte++ == 0) {
++        return sample >> 4;
++    }
++    return (sample & 0x0f) << 4;
++}
++
++static int tsc2007_tx(I2CSlave *i2c, uint8_t data)
++{
++    TSC2007State *s = TSC2007(i2c);
++
++    s->command = data;
++    return 0;
++}
++
++static void tsc2007_event(I2CSlave *i2c, enum i2c_event event)
++{
++    TSC2007State *s = TSC2007(i2c);
++
++    if (event == I2C_START_RECV) {
++        s->rx_byte = 0;
++    }
++}
++
++static void tsc2007_reset(DeviceState *dev)
++{
++    TSC2007State *s = TSC2007(dev);
++
++    s->command = 0;
++    s->rx_byte = 0;
++    s->pressed = 0;
++    tsc2007_set_position(s, INPUT_EVENT_ABS_SIZE / 2,
++                         INPUT_EVENT_ABS_SIZE / 2);
++    tsc2007_update_penirq(s);
++}
++
++static int tsc2007_post_load(void *opaque, int version_id)
++{
++    TSC2007State *s = opaque;
++
++    s->pressed = 0;
++    tsc2007_update_penirq(s);
++    return 0;
++}
++
++static const VMStateDescription vmstate_tsc2007 = {
++    .name = "tsc2007",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .post_load = tsc2007_post_load,
++    .fields = (VMStateField[]) {
++        VMSTATE_I2C_SLAVE(parent_obj, TSC2007State),
++        VMSTATE_UINT8(command, TSC2007State),
++        VMSTATE_INT32(rx_byte, TSC2007State),
++        VMSTATE_INT32(x, TSC2007State),
++        VMSTATE_INT32(y, TSC2007State),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static int tsc2007_init(I2CSlave *i2c)
++{
++    TSC2007State *s = TSC2007(i2c);
++
++    qdev_init_gpio_out(&i2c->qdev, &s->penirq, 1);
++    qemu_add_mouse_event_handler(tsc2007_touch_event, s, 1,
++                                 "QEMU R-LINK TSC2007 Touchscreen");
++    return 0;
++}
++
++static void tsc2007_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
++
++    k->init = tsc2007_init;
++    k->event = tsc2007_event;
++    k->recv = tsc2007_rx;
++    k->send = tsc2007_tx;
++    dc->reset = tsc2007_reset;
++    dc->vmsd = &vmstate_tsc2007;
++}
++
++static const TypeInfo tsc2007_info = {
++    .name = TYPE_TSC2007,
++    .parent = TYPE_I2C_SLAVE,
++    .instance_size = sizeof(TSC2007State),
++    .class_init = tsc2007_class_init,
++};
++
++static void tsc2007_register_types(void)
++{
++    type_register_static(&tsc2007_info);
++}
++
++type_init(tsc2007_register_types)
+diff --git a/hw/scsi/scsi-bus.c b/hw/scsi/scsi-bus.c
+index bd2c0e4ca..d5cb604d1 100644
+--- a/hw/scsi/scsi-bus.c
++++ b/hw/scsi/scsi-bus.c
+@@ -1241,7 +1241,24 @@ int scsi_req_parse_cdb(SCSIDevice *dev, SCSICommand *cmd, uint8_t *buf)
+     int rc;
+ 
+     cmd->lba = -1;
++
++    /* TomTom's SMSC USB SD reader uses this six-byte vendor CDB to return
++     * the 16-byte SD CID. Opcode 0xcf has no standard CDB group length, so
++     * describe this private transfer before applying generic decoding. */
++    if (buf[0] == 0xcf && buf[1] == 0x18 &&
++        buf[2] == 0x00 && buf[3] == 0x00 &&
++        buf[4] == 0x60 && buf[5] == 0x00) {
++        cmd->len = 6;
++        cmd->xfer = 16;
++        cmd->mode = SCSI_XFER_FROM_DEV;
++        memcpy(cmd->buf, buf, cmd->len);
++        return 0;
++    }
++
+     cmd->len = scsi_cdb_length(buf);
++    if (cmd->len < 0) {
++        return -1;
++    }
+ 
+     switch (dev->type) {
+     case TYPE_TAPE:
+diff --git a/hw/scsi/scsi-disk.c b/hw/scsi/scsi-disk.c
+index 54d71f4c0..109330c9c 100644
+--- a/hw/scsi/scsi-disk.c
++++ b/hw/scsi/scsi-disk.c
+@@ -1784,6 +1784,42 @@ static void scsi_disk_emulate_write_data(SCSIRequest *req)
+     }
+ }
+ 
++static int scsi_disk_hex_nibble(char c)
++{
++    if (c >= '0' && c <= '9') {
++        return c - '0';
++    }
++    if (c >= 'a' && c <= 'f') {
++        return c - 'a' + 10;
++    }
++    if (c >= 'A' && c <= 'F') {
++        return c - 'A' + 10;
++    }
++    return -1;
++}
++
++static int scsi_disk_emulate_rlink_cid(SCSIDiskState *s,
++                                        SCSIRequest *req, uint8_t *outbuf)
++{
++    int i;
++
++    if (req->cmd.buf[1] != 0x18 || req->cmd.buf[2] != 0x00 ||
++        req->cmd.buf[3] != 0x00 || req->cmd.buf[4] != 0x60 ||
++        req->cmd.buf[5] != 0x00 || !s->serial || strlen(s->serial) != 32) {
++        return -1;
++    }
++    for (i = 0; i < 16; i++) {
++        int high = scsi_disk_hex_nibble(s->serial[i * 2]);
++        int low = scsi_disk_hex_nibble(s->serial[i * 2 + 1]);
++
++        if (high < 0 || low < 0) {
++            return -1;
++        }
++        outbuf[i] = (high << 4) | low;
++    }
++    return 16;
++}
++
+ static int32_t scsi_disk_emulate_command(SCSIRequest *req, uint8_t *buf)
+ {
+     SCSIDiskReq *r = DO_UPCAST(SCSIDiskReq, req, req);
+@@ -1925,6 +1961,12 @@ static int32_t scsi_disk_emulate_command(SCSIRequest *req, uint8_t *buf)
+             goto illegal_request;
+         }
+         break;
++    case 0xcf:
++        buflen = scsi_disk_emulate_rlink_cid(s, req, outbuf);
++        if (buflen < 0) {
++            goto illegal_request;
++        }
++        break;
+     case MECHANISM_STATUS:
+         buflen = scsi_emulate_mechanism_status(s, outbuf);
+         if (buflen < 0) {
+@@ -2383,6 +2425,7 @@ static const SCSIReqOps *const scsi_disk_reqops_dispatch[256] = {
+     [VERIFY_10]                       = &scsi_disk_emulate_reqops,
+     [VERIFY_12]                       = &scsi_disk_emulate_reqops,
+     [VERIFY_16]                       = &scsi_disk_emulate_reqops,
++    [0xcf]                            = &scsi_disk_emulate_reqops,
+ 
+     [READ_6]                          = &scsi_disk_dma_reqops,
+     [READ_10]                         = &scsi_disk_dma_reqops,
+diff --git a/hw/usb/dev-storage.c b/hw/usb/dev-storage.c
+index ae8d40dc7..a295a14fb 100644
+--- a/hw/usb/dev-storage.c
++++ b/hw/usb/dev-storage.c
+@@ -62,6 +62,8 @@ typedef struct {
+     BlockConf conf;
+     uint32_t removable;
+     SCSIDevice *scsi_dev;
++    char *rlink_cid_string;
++    uint8_t rlink_cid[16];
+ } MSDState;
+ 
+ struct usb_msd_cbw {
+@@ -214,6 +216,62 @@ static const USBDesc desc = {
+     .str   = desc_strings,
+ };
+ 
++/* The R-LINK firmware knows how to retrieve an SD CID through the private
++ * commands implemented by its internal SMSC 0424:4040 USB card reader. */
++static const USBDesc desc_rlink = {
++    .id = {
++        .idVendor          = 0x0424,
++        .idProduct         = 0x4040,
++        .bcdDevice         = 0,
++        .iManufacturer     = STR_MANUFACTURER,
++        .iProduct          = STR_PRODUCT,
++        .iSerialNumber     = STR_SERIALNUMBER,
++    },
++    .full  = &desc_device_full,
++    .high  = &desc_device_high,
++    .super = &desc_device_super,
++    .str   = desc_strings,
++};
++
++static int usb_msd_hex_nibble(char c)
++{
++    if (c >= '0' && c <= '9') {
++        return c - '0';
++    }
++    if (c >= 'a' && c <= 'f') {
++        return c - 'a' + 10;
++    }
++    if (c >= 'A' && c <= 'F') {
++        return c - 'A' + 10;
++    }
++    return -1;
++}
++
++static int usb_msd_parse_rlink_cid(MSDState *s, Error **errp)
++{
++    int i;
++
++    if (!s->rlink_cid_string) {
++        return 0;
++    }
++    if (strlen(s->rlink_cid_string) != 32) {
++        error_setg(errp, "rlink-cid must contain exactly 32 hexadecimal characters");
++        return -1;
++    }
++    for (i = 0; i < 16; i++) {
++        int high = usb_msd_hex_nibble(s->rlink_cid_string[i * 2]);
++        int low = usb_msd_hex_nibble(s->rlink_cid_string[i * 2 + 1]);
++
++        if (high < 0 || low < 0) {
++            error_setg(errp, "rlink-cid contains a non-hexadecimal character");
++            return -1;
++        }
++        s->rlink_cid[i] = (high << 4) | low;
++    }
++    s->dev.usb_desc = &desc_rlink;
++    return 0;
++}
++
+ static void usb_msd_copy_data(MSDState *s, USBPacket *p)
+ {
+     uint32_t len;
+@@ -346,7 +404,7 @@ static void usb_msd_handle_control(USBDevice *dev, USBPacket *p,
+ {
+     MSDState *s = (MSDState *)dev;
+     SCSIDevice *scsi_dev;
+-    int ret, maxlun;
++    int ret, maxlun, i;
+ 
+     ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
+     if (ret >= 0) {
+@@ -377,6 +435,18 @@ static void usb_msd_handle_control(USBDevice *dev, USBPacket *p,
+         data[0] = maxlun;
+         p->actual_length = 1;
+         break;
++    case VendorInterfaceRequest | 0xcd:
++        if (!s->rlink_cid_string || value != 0 || index != 0 || length < 16) {
++            p->status = USB_RET_STALL;
++            break;
++        }
++        /* The SMSC reader returns the 16 CID bytes in reverse order; vold
++         * reverses them before formatting the conventional 32-digit CID. */
++        for (i = 0; i < 16; i++) {
++            data[i] = s->rlink_cid[15 - i];
++        }
++        p->actual_length = 16;
++        break;
+     default:
+         p->status = USB_RET_STALL;
+         break;
+@@ -604,6 +674,10 @@ static void usb_msd_realize_storage(USBDevice *dev, Error **errp)
+     SCSIDevice *scsi_dev;
+     Error *err = NULL;
+ 
++    if (usb_msd_parse_rlink_cid(s, errp) < 0) {
++        return;
++    }
++
+     if (!blk) {
+         error_setg(errp, "drive property not set");
+         return;
+@@ -627,6 +701,10 @@ static void usb_msd_realize_storage(USBDevice *dev, Error **errp)
+     }
+ 
+     blkconf_serial(&s->conf, &dev->serial);
++    if (s->rlink_cid_string) {
++        g_free(dev->serial);
++        dev->serial = g_strdup(s->rlink_cid_string);
++    }
+     blkconf_blocksizes(&s->conf);
+ 
+     /*
+@@ -745,6 +823,7 @@ static const VMStateDescription vmstate_usb_msd = {
+ static Property msd_properties[] = {
+     DEFINE_BLOCK_PROPERTIES(MSDState, conf),
+     DEFINE_PROP_BIT("removable", MSDState, removable, 0, false),
++    DEFINE_PROP_STRING("rlink-cid", MSDState, rlink_cid_string),
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
+diff --git a/hw/usb/host-libusb.c b/hw/usb/host-libusb.c
+index 10f4735dd..8c855b8cf 100644
+--- a/hw/usb/host-libusb.c
++++ b/hw/usb/host-libusb.c
+@@ -64,6 +64,7 @@ struct USBAutoFilter {
+ 
+ enum USBHostDeviceOptions {
+     USB_HOST_OPT_PIPELINE,
++    USB_HOST_OPT_SUPPRESS_RESET,
+ };
+ 
+ struct USBHostDevice {
+@@ -247,6 +248,25 @@ static int usb_host_init(void)
+     return 0;
+ }
+ 
++static void usb_host_deinit(void)
++{
++    const struct libusb_pollfd **poll;
++    int i;
++
++    if (!ctx) {
++        return;
++    }
++    poll = libusb_get_pollfds(ctx);
++    if (poll) {
++        for (i = 0; poll[i] != NULL; i++) {
++            usb_host_del_fd(poll[i]->fd, ctx);
++        }
++    }
++    free(poll);
++    libusb_exit(ctx);
++    ctx = NULL;
++}
++
+ static int usb_host_get_port(libusb_device *dev, char *port, size_t len)
+ {
+     uint8_t path[7];
+@@ -973,6 +993,14 @@ static void usb_host_realize(USBDevice *udev, Error **errp)
+         return;
+     }
+ 
++    /* A host phone may have been plugged in or switched to AOA since this
++     * long-running QEMU process initialized libusb. Refresh immediately when
++     * creating the first usb-host object so device_add can claim the current
++     * usbfs node without waiting for the periodic retry. */
++    if (QTAILQ_EMPTY(&hostdevs)) {
++        usb_host_deinit();
++    }
++
+     loglevel = s->loglevel;
+     udev->flags |= (1 << USB_DEV_FLAG_IS_HOST);
+     udev->auto_attach = 0;
+@@ -1134,18 +1162,29 @@ static void usb_host_set_address(USBHostDevice *s, int addr)
+ static void usb_host_set_config(USBHostDevice *s, int config, USBPacket *p)
+ {
+     int rc;
++    int current_config = -1;
+ 
+     trace_usb_host_set_config(s->bus_num, s->addr, config);
+ 
+     usb_host_release_interfaces(s);
+-    rc = libusb_set_configuration(s->dh, config);
+-    if (rc != 0) {
+-        usb_host_libusb_error("libusb_set_configuration", rc);
+-        p->status = USB_RET_STALL;
+-        if (rc == LIBUSB_ERROR_NO_DEVICE) {
+-            usb_host_nodev(s);
++
++    /* Reapplying an already active configuration restarts some Android USB
++     * gadgets.  When physical reset suppression is requested, the host
++     * kernel's configuration is authoritative and the guest's redundant
++     * SET_CONFIGURATION can be acknowledged without touching the gadget. */
++    rc = libusb_get_configuration(s->dh, &current_config);
++    if (rc != 0 ||
++        !(s->options & (1 << USB_HOST_OPT_SUPPRESS_RESET)) ||
++        current_config != config) {
++        rc = libusb_set_configuration(s->dh, config);
++        if (rc != 0) {
++            usb_host_libusb_error("libusb_set_configuration", rc);
++            p->status = USB_RET_STALL;
++            if (rc == LIBUSB_ERROR_NO_DEVICE) {
++                usb_host_nodev(s);
++            }
++            return;
+         }
+-        return;
+     }
+     p->status = usb_host_claim_interfaces(s, config);
+     if (p->status != USB_RET_SUCCESS) {
+@@ -1366,6 +1405,16 @@ static void usb_host_handle_reset(USBDevice *udev)
+ 
+     trace_usb_host_reset(s->bus_num, s->addr);
+ 
++    /* Some Android gadgets physically disconnect and re-enumerate when the
++     * host issues a port reset.  Mirroring the guest's enumeration reset to
++     * such a device makes the virtual device disappear before the guest can
++     * submit its first bulk transfer.  The physical device was already reset
++     * and enumerated by the host kernel, so allow callers to acknowledge the
++     * virtual reset without issuing another one on the host bus. */
++    if (s->options & (1 << USB_HOST_OPT_SUPPRESS_RESET)) {
++        return;
++    }
++
+     rc = libusb_reset_device(s->dh);
+     if (rc != 0) {
+         usb_host_nodev(s);
+@@ -1483,6 +1532,8 @@ static Property usb_host_dev_properties[] = {
+                        LIBUSB_LOG_LEVEL_WARNING),
+     DEFINE_PROP_BIT("pipeline",    USBHostDevice, options,
+                     USB_HOST_OPT_PIPELINE, true),
++    DEFINE_PROP_BIT("suppress-reset", USBHostDevice, options,
++                    USB_HOST_OPT_SUPPRESS_RESET, false),
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
+@@ -1540,6 +1591,7 @@ static void usb_host_auto_check(void *unused)
+     libusb_device **devs = NULL;
+     struct libusb_device_descriptor ddesc;
+     int unconnected = 0;
++    int connected = 0;
+     int i, n;
+ 
+     if (usb_host_init() != 0) {
+@@ -1601,6 +1653,8 @@ static void usb_host_auto_check(void *unused)
+         QTAILQ_FOREACH(s, &hostdevs, next) {
+             if (s->dh == NULL) {
+                 unconnected++;
++            } else {
++                connected++;
+             }
+             if (s->seen == 0) {
+                 if (s->dh) {
+@@ -1621,6 +1675,14 @@ static void usb_host_auto_check(void *unused)
+             return;
+         }
+ #endif
++        /* libusb 1.0.21 inside a long-running container can retain a stale
++         * device list after Android resets and re-enumerates on the same
++         * physical port. Recreate the context only while every configured
++         * host device is disconnected; the next two-second scan then sees
++         * the new usbfs node and host address. */
++        if (unconnected > 0 && connected == 0) {
++            usb_host_deinit();
++        }
+     }
+ 
+     if (!usb_vmstate) {
+diff --git a/include/hw/arm/arm.h b/include/hw/arm/arm.h
+index 5c940eb41..902827d9d 100644
+--- a/include/hw/arm/arm.h
++++ b/include/hw/arm/arm.h
+@@ -36,6 +36,10 @@ struct arm_boot_info {
+     hwaddr gic_cpu_if_addr;
+     int nb_cpus;
+     int board_id;
++    /* TomTom kernels: ATAG_FACTORYDATA (FDT blob) and ATAG_REVISION */
++    hwaddr rlink_fdt_addr;
++    uint32_t rlink_fdt_size;
++    uint32_t rlink_sysrev;
+     /* ARM machines that support the ARM Security Extensions use this field to
+      * control whether Linux is booted as secure(true) or non-secure(false).
+      */
+diff --git a/include/hw/arm/omap.h b/include/hw/arm/omap.h
+index 0199cc4ed..86c3c3dbf 100644
+--- a/include/hw/arm/omap.h
++++ b/include/hw/arm/omap.h
+@@ -1218,7 +1218,10 @@ enum {
+ #define OMAP_GPIOSW_INVERTED	0x0001
+ #define OMAP_GPIOSW_OUTPUT	0x0002
+ 
+-# define TCMI_VERBOSE			1
++/* R-LINK userspace polls several legacy OMAP registers using a wider access
++ * than the model expects.  The fallback handles those accesses correctly,
++ * but logging every poll grows the container log without bound. */
++/* #define TCMI_VERBOSE */
+ 
+ # ifdef TCMI_VERBOSE
+ #  define OMAP_8B_REG(paddr)		\

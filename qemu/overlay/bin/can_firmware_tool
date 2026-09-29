@@ -1,0 +1,3 @@
+#!/system/bin/sh
+# QEMU stub: no CAN microcontroller in the emulator. Exit 2 = "UNKNOWN", initramfs continues.
+exit 2

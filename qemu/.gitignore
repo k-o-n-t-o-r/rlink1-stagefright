@@ -1,0 +1,23 @@
+# Local configuration and QEMU build tree
+config.env
+.build/
+
+# Runtime state
+*.sock
+*.log
+*.mem.bin
+__pycache__/
+screenshots/
+.smoke.*
+.*.screenshot.*
+.*.sd-create.*
+.sd.img.*
+staging/.mkrw.*/
+
+# Large generated images (remove these entries if artifacts are intentionally versioned)
+Image
+sd.img
+removable.img
+maps-navigation-sdcard.img
+staging/p2/rootfs.img
+staging/p2/rootfs.img.rw

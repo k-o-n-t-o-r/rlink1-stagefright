@@ -1,0 +1,27 @@
+/dts-v1/;
+/ {
+	features {
+		device-class = <1>;
+		hardware-version = <4>;
+		has-bluetooth = <1>;
+		screen-rotation = <0>;
+		tft = "g070y2l01";
+		device-serial = "QEMU000000000001";
+		hardware-name = "strasbourg";
+		project-name = "strasbourg";
+		automotive {
+			supplier-number = "0";
+			part-number = "0";
+			manu-id-code = "0";
+			hw-sw-ref-rsa = "0";
+			hw-sw-ref-dai = "0";
+			diag-id-code = "0";
+			basic-part-list-idx = "0";
+		};
+	};
+	options {
+		audio { has-booster = <2>; };
+		sound { i2s-bus-num = <0>; };
+		gps { type = "none"; ephemeris = "none"; };
+	};
+};

@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# One entry point for building, running, and inspecting the R-LINK emulator.
+set -euo pipefail
+
+QEMU_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=lib/common.sh
+source "$QEMU_DIR/lib/common.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: ./rlink-qemu <command> [arguments]
+
+Build:
+  doctor                    Validate dependencies and artifacts
+  build-qemu                Fetch, patch, and compile qemu-linaro
+  prepare [rootfs.img.new]  Build DTB, kernels, rootfs, and sd.img
+
+Lifecycle:
+  start [debug|stock] [-- QEMU args...]
+  restart [debug|stock]     Stop and start the emulator
+  stop                      Remove the emulator container
+  status                    Show container and forwarded ports
+  wait [seconds]            Wait for Android and the visible Home UI
+
+Removable media:
+  sd-create [options] [image]  Create an atomic FAT32 card image
+  sd-attach [image]            Hotplug an image at /mnt/sdcard
+  sd-detach [--force]          Unmount and unplug the current card
+  usb-attach [BUS PORT]        Forward a physical Android phone by host port
+  usb-detach                   Remove the forwarded phone
+  usb-status                   Show host/guest phone attachment state
+
+Debug:
+  shell                     Open the interactive root UART
+  exec <command>            Run a guest shell command
+  logs                      Follow the guest serial log
+  host-logs                 Follow QEMU's stderr
+  monitor <command>         Run a QEMU monitor command
+  dmesg                     Recover printk output from guest RAM
+  screenshot [file.png]     Capture the 800x480 LCD
+  tap <x> <y>               Send an absolute touchscreen tap through VNC
+  heap-trace-start          Restart mediaserver with dlmalloc tracing
+  heap-trace-arm            Arm tracing for the next tiny allocation
+  heap-trace-disarm         Disable allocation-triggered tracing
+  heap-trace-stop           Restore the normal mediaserver
+  heap-trace-show           Print the mediaserver heap trace
+  heap-trace-clear          Clear the mediaserver heap trace
+  heap-trace-status         Show tracer and mediaserver status
+  exploit-reset             Fast mediaserver/tool cleanup without a VM reboot
+  smoke [seconds]           Check shell, framework, and framebuffer
+
+Local settings belong in config.env; see config.env.example.
+EOF
+}
+
+command=${1:-help}
+(($# == 0)) || shift
+case $command in
+    help|-h|--help)
+        usage
+        ;;
+    doctor)
+        exec "$QEMU_DIR/doctor.sh" "$@"
+        ;;
+    build-qemu)
+        exec "$QEMU_DIR/build-qemu.sh" "$@"
+        ;;
+    prepare)
+        (($# <= 1)) || die "usage: ./rlink-qemu prepare [rootfs.img.new]"
+        if command -v docker >/dev/null 2>&1 && container_running; then
+            die "stop $NAME before rebuilding its disk"
+        fi
+        "$QEMU_DIR/mkdtb.sh"
+        "$QEMU_DIR/mkkernel.sh"
+        if (($#)); then
+            "$QEMU_DIR/mkrw.sh" "$1"
+        else
+            "$QEMU_DIR/mkrw.sh"
+        fi
+        "$QEMU_DIR/mksd.sh"
+        ;;
+    start)
+        mode=debug
+        if [[ ${1:-} == debug || ${1:-} == stock ]]; then
+            mode=$1
+            shift
+        fi
+        [[ ${1:-} != -- ]] || shift
+        exec "$QEMU_DIR/run.sh" "--$mode" -- "$@"
+        ;;
+    restart)
+        mode=${1:-debug}
+        [[ "$mode" == debug || "$mode" == stock ]] || die "mode must be debug or stock"
+        [[ $# == 0 ]] || shift
+        if container_exists; then
+            docker rm -f "$NAME" >/dev/null
+        fi
+        exec "$QEMU_DIR/run.sh" "--$mode" -- "$@"
+        ;;
+    stop)
+        need_cmd docker
+        if container_exists; then
+            docker rm -f "$NAME" >/dev/null
+            note "stopped $NAME"
+        else
+            note "$NAME is not running"
+        fi
+        rm -f "$QEMU_DIR/$NAME.mon.sock" "$QEMU_DIR/$NAME.mem.bin"
+        ;;
+    status)
+        need_cmd docker
+        if container_exists; then
+            docker ps -a --filter "name=^/${NAME}$" \
+                --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+        else
+            printf '%s is not running\n' "$NAME"
+            exit 1
+        fi
+        ;;
+    wait)
+        exec "$QEMU_DIR/wait.sh" "${1:-$BOOT_TIMEOUT}"
+        ;;
+    sd-create)
+        exec "$QEMU_DIR/sd-card.sh" create "$@"
+        ;;
+    sd-attach)
+        exec "$QEMU_DIR/sd-card.sh" attach "$@"
+        ;;
+    sd-detach)
+        exec "$QEMU_DIR/sd-card.sh" detach "$@"
+        ;;
+    usb-attach)
+        exec "$QEMU_DIR/usb-phone.sh" attach "$@"
+        ;;
+    usb-detach)
+        exec "$QEMU_DIR/usb-phone.sh" detach "$@"
+        ;;
+    usb-status)
+        exec "$QEMU_DIR/usb-phone.sh" status "$@"
+        ;;
+    shell)
+        container_running || die "container $NAME is not running"
+        printf 'R-LINK root shell; disconnect with Ctrl-] (socat) or Ctrl-C (nc).\n' >&2
+        if command -v socat >/dev/null 2>&1; then
+            exec socat -,rawer,escape=0x1d "TCP:127.0.0.1:$SHELL_PORT"
+        elif command -v nc >/dev/null 2>&1; then
+            exec nc 127.0.0.1 "$SHELL_PORT"
+        else
+            die "install socat or netcat for an interactive shell"
+        fi
+        ;;
+    exec)
+        (($#)) || die "usage: ./rlink-qemu exec <guest command>"
+        exec python3 "$QEMU_DIR/guest-exec.py" --port "$SHELL_PORT" --timeout "${GUEST_TIMEOUT:-30}" -- "$*"
+        ;;
+    logs)
+        touch "$QEMU_DIR/$NAME.serial.log"
+        exec tail -n "${LINES:-100}" -F "$QEMU_DIR/$NAME.serial.log"
+        ;;
+    host-logs)
+        container_exists || die "container $NAME does not exist"
+        exec docker logs -f --tail "${LINES:-100}" "$NAME"
+        ;;
+    monitor)
+        (($#)) || die "usage: ./rlink-qemu monitor <command>"
+        exec "$QEMU_DIR/mon.sh" "$*"
+        ;;
+    dmesg)
+        exec "$QEMU_DIR/dmesg.sh"
+        ;;
+    screenshot)
+        (($# <= 1)) || die "usage: ./rlink-qemu screenshot [file.png]"
+        exec "$QEMU_DIR/screenshot.sh" "$@"
+        ;;
+    tap)
+        (($# == 2)) || die "usage: ./rlink-qemu tap <x> <y>"
+        [[ "$VNC_PORT" != 0 ]] || die "VNC is disabled (VNC_PORT=0)"
+        exec python3 "$QEMU_DIR/vnc-tap.py" --port "$VNC_PORT" "$1" "$2"
+        ;;
+    heap-trace-start)
+        exec "$QEMU_DIR/heap-trace.sh" start
+        ;;
+    heap-trace-arm)
+        exec "$QEMU_DIR/heap-trace.sh" arm
+        ;;
+    heap-trace-disarm)
+        exec "$QEMU_DIR/heap-trace.sh" disarm
+        ;;
+    heap-trace-stop)
+        exec "$QEMU_DIR/heap-trace.sh" stop
+        ;;
+    heap-trace-show)
+        exec "$QEMU_DIR/heap-trace.sh" show
+        ;;
+    heap-trace-clear)
+        exec "$QEMU_DIR/heap-trace.sh" clear
+        ;;
+    heap-trace-status)
+        exec "$QEMU_DIR/heap-trace.sh" status
+        ;;
+    exploit-reset)
+        exec "$QEMU_DIR/exploit-reset.sh" "$@"
+        ;;
+    smoke)
+        exec "$QEMU_DIR/smoke-test.sh" "${1:-$BOOT_TIMEOUT}"
+        ;;
+    *)
+        usage >&2
+        die "unknown command: $command"
+        ;;
+esac

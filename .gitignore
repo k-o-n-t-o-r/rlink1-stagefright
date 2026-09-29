@@ -1,0 +1,75 @@
+# Local Python/editor state
+__pycache__/
+*.py[cod]
+.venv/
+.idea/
+.vscode/
+
+# Proprietary/extracted R-LINK firmware (never commit)
+/temp
+/firmware
+/rootfs
+*.img
+*.img.*
+qemu/zImage
+qemu/Image
+qemu/Image-debug
+qemu/rlink.dtb
+qemu/staging/
+qemu/overlay/lib/libc.so
+
+# Derived from the user's firmware at build time
+/exploit/car_android_auto/gps_lpe/glconfig.xml
+/qemu/overlay/default.prop
+/qemu/overlay/init.rc
+/qemu/overlay/init.strasbourg.rc
+
+# QEMU checkout, local configuration, and runtime state
+qemu/.build/
+qemu/config.env
+qemu/*.sock
+qemu/*.mem.bin
+qemu/screenshots/
+qemu/.smoke.*
+qemu/.*.screenshot.*
+qemu/.*.sd-create.*
+qemu/.sd.img.*
+
+# Locally generated exploit media and deployment bundles
+/exploit/car_android_auto/dist/
+/exploit/usb_stick/
+*.m4a
+*.zip
+!/exploit/fixtures/test_audio.m4a
+
+# Private notes and machine/device captures
+/knowledge-base/
+/*.md
+!/README.md
+**/*-evidence/
+**/evidence/
+**/car-tests/
+**/cartest*/
+**/tombstone*
+cartest*
+car-test*
+tombstone*
+headunit-*
+head-unit-*
+logcat*.txt
+dmesg*.txt
+last_kmsg*
+*.log
+*.trace
+*.core
+core
+core.*
+*.dmp
+*.pcap
+*.pcapng
+*.usbmon
+
+# Temporary exploit/test output
+*.tmp
+*.part
+.DS_Store
